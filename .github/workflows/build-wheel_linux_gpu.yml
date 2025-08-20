@@ -20,7 +20,7 @@ jobs:
           wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y cuda-toolkit-12-0  # Change to your local CUDA version if different (check with 'nvcc --version' or 'nvidia-smi' on your Linux system)
+          sudo apt-get install -y cuda-toolkit-12-2  # Change to your local CUDA version if different (check with 'nvcc --version' or 'nvidia-smi' on your Linux system)
 
       - name: Install build dependencies
         run: python -m pip install --upgrade pip wheel setuptools cibuildwheel cmake
@@ -28,10 +28,10 @@ jobs:
       - name: Build wheel
         env:
           CMAKE_ARGS: "-DGGML_CUDA=on"
-          CIBW_BUILD: cp312-manylinux_x86_64
+          CIBW_BUILD: cp310-manylinux_x86_64
           CIBW_ARCHS: x86_64
           CIBW_BUILD_VERBOSITY: 3
-          CIBW_ENVIRONMENT: "PATH=/usr/local/cuda-12.5/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda-12.5/lib64:$LD_LIBRARY_PATH"  # Adjust CUDA version to match installed
+          CIBW_ENVIRONMENT: "PATH=/usr/local/cuda-12.2/bin:$PATH LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH"  # Adjust CUDA version to match installed
           CIBW_REPAIR_WHEEL_COMMAND: ""  # Skip auditwheel repair to avoid ABI issues; produces a 'linux_x86_64' wheel instead of 'manylinux'
         run: cibuildwheel --output-dir wheelhouse --platform linux
 
