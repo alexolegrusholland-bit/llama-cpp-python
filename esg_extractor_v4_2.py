@@ -62,6 +62,16 @@ try:
 except Exception:
     pass
 
+# Runtime env tuning for CUDA memory and tokenizer workers
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+try:
+    # A100: prefer TF32 and allow cuDNN TF32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+except Exception:
+    pass
+
 # ----------------------------- Paths / Config -----------------------------
 MODEL_PATH = os.environ.get("ESG_MODEL_PATH", "/home/inghero/data/dqanalysis/llm/parc/qwen3_14B")
 COMPANIES_INPUT_DIR = os.environ.get("ESG_COMPANIES_INPUT_DIR", "/home/inghero/data/dqanalysis/llm/parc/notebooks/ESG_Ratings_input")
@@ -77,6 +87,8 @@ os.makedirs(CHUNK_OUTPUTS_DIR, exist_ok=True)
 # OCR / rendering
 DPI = int(os.environ.get("ESG_DPI", "300"))
 LANGUAGES = [s for s in os.environ.get("ESG_LANGS", "en,nl,fr").split(",") if s]
+# OCR GPU preference: 'auto' | '1' | '0'
+OCR_GPU_PREF = os.environ.get("ESG_OCR_GPU", "auto").strip().lower()
 MODEL_DIR = os.path.expanduser("~/.EasyOCR/model")
 ROW_THRESHOLD = 40  # for grouping OCR words into lines
 
@@ -154,10 +166,16 @@ def get_ocr_reader():
         os.makedirs(MODEL_DIR, exist_ok=True)
         try:
             logger.info("Initializing EasyOCR reader...")
-            _reader = easyocr.Reader(LANGUAGES, gpu=torch.cuda.is_available(), model_storage_directory=MODEL_DIR)
+            use_gpu = torch.cuda.is_available() if OCR_GPU_PREF in ("1", "auto") else False
+            if OCR_GPU_PREF == "0":
+                use_gpu = False
+            _reader = easyocr.Reader(LANGUAGES, gpu=use_gpu, model_storage_directory=MODEL_DIR)
         except Exception as e:
             logger.warning(f"EasyOCR init with model dir failed ({e}); retrying with defaults...")
-            _reader = easyocr.Reader(LANGUAGES, gpu=torch.cuda.is_available())
+            use_gpu = torch.cuda.is_available() if OCR_GPU_PREF in ("1", "auto") else False
+            if OCR_GPU_PREF == "0":
+                use_gpu = False
+            _reader = easyocr.Reader(LANGUAGES, gpu=use_gpu)
     return _reader
 
 def pixmap_to_numpy(pix: fitz.Pixmap) -> np.ndarray:
@@ -388,6 +406,9 @@ def split_text_into_chunks(text: str, tokenizer, overlap_tokens: int = 128) -> L
         gb = estimate_free_vram_gb()
         if gb > 24:
             max_chunk_size = 7000
+        elif gb > 18:
+            # tuned for A100 20GB
+            max_chunk_size = 5000
         elif gb > 16:
             max_chunk_size = 4500
         elif gb > 8:
@@ -453,7 +474,9 @@ def extract_report_info_from_batch_json(batch_chunks, model, tokenizer, language
         with torch.inference_mode():
             inputs = tokenizer(
                 prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_input_len
-            ).to(model.device if hasattr(model, "device") else "cpu")
+            )
+            # For device_map="auto", prefer explicit cuda device for inputs
+            inputs = {k: v.to("cuda" if torch.cuda.is_available() else "cpu") for k, v in inputs.items()}
             outputs = model.generate(
                 **inputs, max_new_tokens=800, do_sample=False, num_beams=1, use_cache=True,
                 eos_token_id=tokenizer.eos_token_id, pad_token_id=tokenizer.pad_token_id
@@ -736,11 +759,27 @@ def initialize_model(model_path: str = MODEL_PATH):
     except Exception:
         pass
     device_map = "auto" if torch.cuda.is_available() else "cpu"
-    attn_impl = "sdpa" if torch.cuda.is_available() else None
+    # Prefer FlashAttention 2 on A100 if available; fallback to SDPA
+    attn_impl = None
+    if torch.cuda.is_available():
+        try:
+            from transformers.utils import is_flash_attn_2_available
+            if is_flash_attn_2_available():
+                attn_impl = "flash_attention_2"
+            else:
+                attn_impl = "sdpa"
+        except Exception:
+            attn_impl = "sdpa"
     quant_config = None
     if torch.cuda.is_available() and _HAVE_BNB:
         try:
-            quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+            # Optimized 4-bit for A100: nf4 + double quant + bf16 compute
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
         except Exception as e:
             logger.warning(f"BitsAndBytesConfig failed: {e}. No quantization.")
     try:
@@ -749,12 +788,24 @@ def initialize_model(model_path: str = MODEL_PATH):
             kwargs["attn_implementation"] = attn_impl
         if quant_config:
             kwargs["quantization_config"] = quant_config
+        else:
+            # Non-quantized path: prefer bf16 on A100
+            if torch.cuda.is_available():
+                kwargs["torch_dtype"] = torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         tokenizer.padding_side = "right"
         if tokenizer.pad_token is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
-        logger.info(f"Model ready (attn={attn_impl or 'default'}, quant={'4bit' if quant_config else 'none'})")
+        model.eval()
+        # Optional torch.compile for extra throughput on Ampere
+        if os.environ.get("ESG_TORCH_COMPILE", "0") == "1":
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+                logger.info("torch.compile enabled")
+            except Exception as e:
+                logger.warning(f"torch.compile failed: {e}")
+        logger.info(f"Model ready (attn={attn_impl or 'default'}, quant={'4bit' if quant_config else 'none'}, dtype={getattr(model, 'dtype', 'mixed')})")
         return model, tokenizer
     except Exception as e:
         logger.error(f"Model initialization failed: {e}")
