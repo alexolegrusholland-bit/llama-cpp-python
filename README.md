@@ -1,3 +1,55 @@
+### ESG Ratings Extractor (V4.2)
+
+Deterministic table-backed grade extraction plus optional LLM-based narrative parsing.
+
+#### Setup
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+EasyOCR will download models on first run to `~/.EasyOCR/model`.
+
+#### Usage
+
+Run across all companies (default directories):
+
+```bash
+python esg_extractor_v4_2.py --all --skip-unzip
+```
+
+Table-only mode (no LLM, faster):
+
+```bash
+python esg_extractor_v4_2.py --all --table-only
+```
+
+Override directories and model path:
+
+```bash
+python esg_extractor_v4_2.py \
+  --companies-input-dir /path/to/ESG_Ratings_input \
+  --companies-input-dir-fld /path/to/ESG_Ratings_input/company_outputs \
+  --output-csv /path/to/ESG_Ratings_output/ESG_Ratings_output.csv \
+  --model-path /path/to/qwen3_14B \
+  --dpi 300 --languages en,nl,fr --all
+```
+
+If model initialization fails, the script falls back to table-only by default. Disable this via `--no-fallback-table-only`.
+
+#### API
+
+```python
+from esg_extractor_v4_2 import run_pipeline
+
+run_pipeline(all_companies=True, table_only=True,
+             companies_input_dir_fld="/path/company_outputs",
+             output_csv="/tmp/ESG_Ratings_output.csv")
+```
+
+Outputs are saved to the CSV path specified (pipe-delimited). Intermediate OCR text and consolidated JSON are stored in `extracted_texts_esg_ratings/` and `chunk_outputs_esg_ratings/`.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/abetlen/llama-cpp-python/main/docs/icon.svg" style="height: 5rem; width: 5rem">
 </p>
